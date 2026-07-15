@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     canvas, div, fill, point, prelude::*, px, rgb, size, App, Application, Bounds, Context,
-    FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point,
-    ScrollDelta, ScrollWheelEvent, SharedString, Timer, TitlebarOptions, Window, WindowBounds,
-    WindowOptions,
+    ExternalPaths, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels,
+    Point, ScrollDelta, ScrollWheelEvent, SharedString, Timer, TitlebarOptions, Window,
+    WindowBounds, WindowOptions,
 };
 
 use camera::Camera;
@@ -101,6 +101,9 @@ struct SimulatorView {
     rate_ema: f64,
     last_step: Option<Instant>,
     pop_delta: i64,
+    // When true, dropped images stamp bright pixels as live cells instead
+    // of dark ones.
+    invert_import: bool,
     // While the mouse is held on the canvas, the cell value being painted:
     // alive if the stroke started on a dead cell, dead otherwise.
     painting: Option<bool>,
@@ -150,6 +153,7 @@ impl SimulatorView {
             rate_ema: 0.,
             last_step: None,
             pop_delta: 0,
+            invert_import: false,
             painting: None,
             pan_last: None,
             focus_handle,
@@ -234,6 +238,39 @@ impl SimulatorView {
         cx.notify();
     }
 
+    /// Stamp dropped image files into the world, centered on the current
+    /// view. Naive luminance threshold: dark opaque pixels become live
+    /// cells (or bright ones with `invert_import`); transparent pixels
+    /// always stay dead.
+    fn drop_images(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
+        const MAX_DIM: u32 = 256;
+        let mut placed = false;
+        for path in paths.paths() {
+            let img = match image::open(path) {
+                Ok(img) => img,
+                Err(err) => {
+                    eprintln!("could not load {}: {err}", path.display());
+                    continue;
+                }
+            };
+            let img = img.thumbnail(MAX_DIM, MAX_DIM).to_luma_alpha8();
+            let (w, h) = img.dimensions();
+            let origin_x = self.camera.center_x.round() as i64 - w as i64 / 2;
+            let origin_y = self.camera.center_y.round() as i64 - h as i64 / 2;
+            for (px_x, px_y, pixel) in img.enumerate_pixels() {
+                let [luma, alpha] = pixel.0;
+                if alpha >= 128 && ((luma < 128) != self.invert_import) {
+                    self.world
+                        .set(origin_x + px_x as i64, origin_y + px_y as i64, true);
+                }
+            }
+            placed = true;
+        }
+        if placed {
+            cx.notify();
+        }
+    }
+
     fn save_snapshot(&mut self) {
         self.snapshot = Some(self.world.clone());
     }
@@ -283,6 +320,7 @@ impl SimulatorView {
             }
             "]" => self.rule_index = (self.rule_index + 1) % self.rules.len(),
             "t" => self.theme_index = (self.theme_index + 1) % self.themes.len(),
+            "i" => self.invert_import = !self.invert_import,
             "left" => self.camera.pan_pixels(-PAN_STEP, 0.),
             "right" => self.camera.pan_pixels(PAN_STEP, 0.),
             "up" => self.camera.pan_pixels(0., -PAN_STEP),
@@ -789,6 +827,24 @@ impl Render for SimulatorView {
                                     })),
                             ),
                     )
+                    .child(
+                        div()
+                            .id("invert-import")
+                            .px_2()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .bg(rgb(t.chip_bg))
+                            .hover(move |el| el.text_color(rgb(t.accent)))
+                            .child(if self.invert_import {
+                                "img: light→live"
+                            } else {
+                                "img: dark→live"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.invert_import = !this.invert_import;
+                                cx.notify();
+                            })),
+                    )
                     .child(div().flex_1().child(rule_label))
                     .child(
                         div()
@@ -851,8 +907,12 @@ impl Render for SimulatorView {
                     .flex()
                     .child(
                         div()
+                            .id("sim-canvas")
                             .flex_1()
                             .m_2()
+                            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                                this.drop_images(paths, cx);
+                            }))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, event, _, cx| this.begin_paint(event, cx)),
@@ -928,7 +988,7 @@ impl Render for SimulatorView {
                     .child(
                         "space pause · n step · , . speed · r randomize · c clear · s save · b back · \
                          scroll zoom · middle-drag pan · arrows pan · 0 reset camera · \
-                         [ ] rule · t theme · drag paint · ⌘Z undo stack edit",
+                         [ ] rule · t theme · i invert import · drag paint · ⌘Z undo stack edit",
                     ),
             )
     }
