@@ -27,21 +27,25 @@ const MAX_TICK_MS: u64 = 1280;
 
 const DURATION_PRESETS: [u32; 9] = [1, 2, 5, 10, 25, 50, 100, 250, 500];
 
-fn next_preset(current: u32) -> u32 {
-    DURATION_PRESETS
-        .iter()
-        .copied()
-        .find(|&p| p > current)
-        .unwrap_or(current)
+/// Step up through the presets; past the largest comes `None` (infinite).
+fn next_preset(current: Option<u32>) -> Option<u32> {
+    let current = current?;
+    DURATION_PRESETS.iter().copied().find(|&p| p > current)
 }
 
-fn prev_preset(current: u32) -> u32 {
-    DURATION_PRESETS
-        .iter()
-        .rev()
-        .copied()
-        .find(|&p| p < current)
-        .unwrap_or(current)
+/// Step down through the presets; from infinite, back to the largest.
+fn prev_preset(current: Option<u32>) -> Option<u32> {
+    match current {
+        None => DURATION_PRESETS.last().copied(),
+        Some(current) => Some(
+            DURATION_PRESETS
+                .iter()
+                .rev()
+                .copied()
+                .find(|&p| p < current)
+                .unwrap_or(current),
+        ),
+    }
 }
 
 /// Payload for dragging a rule out of the library into the stack.
@@ -87,6 +91,8 @@ struct SimulatorView {
     theme_index: usize,
     editor: StackEditor,
     stack_enabled: bool,
+    // Generation at which the stack (re)started; replay resets it to "now".
+    stack_origin: u64,
     running: bool,
     // Simulation pacing and health metrics.
     tick_ms: u64,
@@ -137,6 +143,7 @@ impl SimulatorView {
             theme_index: 0,
             editor: StackEditor::default(),
             stack_enabled: false,
+            stack_origin: 0,
             running: true,
             tick_ms: DEFAULT_TICK_MS,
             step_ms_ema: 0.,
@@ -158,7 +165,17 @@ impl SimulatorView {
         if !self.stack_enabled {
             return None;
         }
-        self.editor.stack.entry_at(self.world.generation)
+        // saturating_sub: restore/clear can move the generation below the
+        // origin; treat that as the stack having just started.
+        self.editor
+            .stack
+            .entry_at(self.world.generation.saturating_sub(self.stack_origin))
+    }
+
+    /// Restart the stack sequence from its first entry, as of now.
+    fn replay_stack(&mut self) {
+        self.stack_origin = self.world.generation;
+        self.stack_enabled = true;
     }
 
     fn current_rule(&self) -> BsRule {
@@ -251,7 +268,10 @@ impl SimulatorView {
             "," => self.tick_ms = (self.tick_ms * 2).min(MAX_TICK_MS),
             "." => self.tick_ms = (self.tick_ms / 2).max(MIN_TICK_MS),
             "r" => self.randomize_visible(),
-            "c" => self.world.clear(),
+            "c" => {
+                self.world.clear();
+                self.stack_origin = 0;
+            }
             "s" => self.save_snapshot(),
             "b" => {
                 if !self.restore_snapshot() {
@@ -351,7 +371,7 @@ impl SimulatorView {
             entry: StackEntry {
                 name: dragged.name.to_string(),
                 rule: dragged.rule,
-                generations: 50,
+                generations: Some(50),
             },
         });
         self.stack_enabled = true;
@@ -484,7 +504,10 @@ impl SimulatorView {
                     .min_w(px(44.))
                     .text_center()
                     .text_color(rgb(t.accent))
-                    .child(format!("{generations} gen")),
+                    .child(match generations {
+                        Some(n) => format!("{n} gen"),
+                        None => "∞".to_string(),
+                    }),
             )
             .child(
                 button(format!("dur-up-{index}").into(), "+").on_click(cx.listener(
@@ -547,6 +570,15 @@ impl SimulatorView {
                     .items_center()
                     .gap_2()
                     .child(div().flex_1().text_color(rgb(t.text)).child("Rule Stack"))
+                    .child(
+                        header_button("stack-replay", "↻", !self.editor.stack.is_empty())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if !this.editor.stack.is_empty() {
+                                    this.replay_stack();
+                                    cx.notify();
+                                }
+                            })),
+                    )
                     .child(
                         header_button("undo", "↩", self.editor.can_undo()).on_click(cx.listener(
                             |this, _, _, cx| {

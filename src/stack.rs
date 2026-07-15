@@ -3,11 +3,12 @@ use serde::{Deserialize, Serialize};
 use crate::rule::BsRule;
 
 /// One segment of a rule stack: run `rule` for `generations` steps.
+/// `None` means run forever — the stack stops there and never loops back.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StackEntry {
     pub name: String,
     pub rule: BsRule,
-    pub generations: u32,
+    pub generations: Option<u32>,
 }
 
 /// A looping sequence of rules. Plain, serializable data — no UI state.
@@ -21,25 +22,39 @@ impl RuleStack {
         self.entries.is_empty()
     }
 
-    pub fn total_generations(&self) -> u64 {
-        self.entries.iter().map(|e| e.generations as u64).sum()
-    }
-
-    /// Which entry is active at the given generation. The stack loops: after
-    /// the last segment finishes, the first starts again.
+    /// Which entry is active at the given generation. The stack loops after
+    /// the last segment finishes — unless it hits an infinite entry, which
+    /// absorbs every generation from its start onward.
     pub fn entry_at(&self, generation: u64) -> Option<(usize, &StackEntry)> {
-        let total = self.total_generations();
-        if total == 0 {
+        if self.entries.is_empty() {
             return None;
         }
-        let mut offset = generation % total;
-        for (index, entry) in self.entries.iter().enumerate() {
-            if offset < entry.generations as u64 {
-                return Some((index, entry));
+        let has_infinite = self.entries.iter().any(|e| e.generations.is_none());
+        let mut offset = if has_infinite {
+            generation
+        } else {
+            let total: u64 = self
+                .entries
+                .iter()
+                .map(|e| e.generations.unwrap_or(0) as u64)
+                .sum();
+            if total == 0 {
+                return None;
             }
-            offset -= entry.generations as u64;
+            generation % total
+        };
+        for (index, entry) in self.entries.iter().enumerate() {
+            match entry.generations {
+                None => return Some((index, entry)),
+                Some(span) => {
+                    if offset < span as u64 {
+                        return Some((index, entry));
+                    }
+                    offset -= span as u64;
+                }
+            }
         }
-        unreachable!("offset < total ensures a segment matches")
+        unreachable!("offset is within the total span or an infinite entry matched")
     }
 }
 
@@ -47,10 +62,23 @@ impl RuleStack {
 /// invert itself: add↔remove, move↔move-back, set stores the old value.
 #[derive(Clone, Debug)]
 pub enum EditCommand {
-    Add { index: usize, entry: StackEntry },
-    Remove { index: usize, entry: StackEntry },
-    SetGenerations { index: usize, old: u32, new: u32 },
-    Move { from: usize, to: usize },
+    Add {
+        index: usize,
+        entry: StackEntry,
+    },
+    Remove {
+        index: usize,
+        entry: StackEntry,
+    },
+    SetGenerations {
+        index: usize,
+        old: Option<u32>,
+        new: Option<u32>,
+    },
+    Move {
+        from: usize,
+        to: usize,
+    },
 }
 
 impl EditCommand {
@@ -135,7 +163,7 @@ mod tests {
         StackEntry {
             name: name.to_string(),
             rule: BsRule::parse(notation).unwrap(),
-            generations,
+            generations: Some(generations),
         }
     }
 
@@ -168,12 +196,59 @@ mod tests {
     }
 
     #[test]
+    fn infinite_entry_stops_loopback() {
+        let mut editor = editor_with(&[("Life", "B3/S23", 10)]);
+        editor.apply(EditCommand::Add {
+            index: 1,
+            entry: StackEntry {
+                name: "Seeds".to_string(),
+                rule: BsRule::parse("B2/S").unwrap(),
+                generations: None,
+            },
+        });
+        let stack = &editor.stack;
+        assert_eq!(stack.entry_at(9).unwrap().0, 0);
+        assert_eq!(stack.entry_at(10).unwrap().0, 1);
+        assert_eq!(stack.entry_at(1_000_000).unwrap().0, 1, "never loops back");
+    }
+
+    #[test]
+    fn lone_infinite_entry_is_always_active() {
+        let mut editor = StackEditor::default();
+        editor.apply(EditCommand::Add {
+            index: 0,
+            entry: StackEntry {
+                name: "Life".to_string(),
+                rule: BsRule::parse("B3/S23").unwrap(),
+                generations: None,
+            },
+        });
+        assert_eq!(editor.stack.entry_at(0).unwrap().0, 0);
+        assert_eq!(editor.stack.entry_at(u64::MAX / 2).unwrap().0, 0);
+    }
+
+    #[test]
+    fn set_generations_to_infinite_round_trips_through_undo() {
+        let mut editor = editor_with(&[("Life", "B3/S23", 10)]);
+        editor.apply(EditCommand::SetGenerations {
+            index: 0,
+            old: Some(10),
+            new: None,
+        });
+        assert_eq!(editor.stack.entries[0].generations, None);
+        editor.undo();
+        assert_eq!(editor.stack.entries[0].generations, Some(10));
+        editor.redo();
+        assert_eq!(editor.stack.entries[0].generations, None);
+    }
+
+    #[test]
     fn undo_redo_round_trips_all_commands() {
         let mut editor = editor_with(&[("Life", "B3/S23", 10), ("Seeds", "B2/S", 5)]);
         editor.apply(EditCommand::SetGenerations {
             index: 1,
-            old: 5,
-            new: 50,
+            old: Some(5),
+            new: Some(50),
         });
         editor.apply(EditCommand::Move { from: 1, to: 0 });
         editor.apply(EditCommand::Remove {
@@ -183,7 +258,7 @@ mod tests {
         let final_state = editor.stack.clone();
         assert_eq!(final_state.entries.len(), 1);
         assert_eq!(final_state.entries[0].name, "Seeds");
-        assert_eq!(final_state.entries[0].generations, 50);
+        assert_eq!(final_state.entries[0].generations, Some(50));
 
         while editor.undo() {}
         assert!(editor.stack.is_empty());
