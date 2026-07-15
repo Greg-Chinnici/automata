@@ -17,6 +17,7 @@ pub struct ChunkPos {
 }
 
 /// A dense square of cells. Only chunks containing live cells are stored.
+#[derive(Clone)]
 struct Chunk {
     cells: Box<[bool]>,
     live: u32,
@@ -53,6 +54,7 @@ impl Chunk {
 /// Stepping is double-buffered — each generation is computed from an
 /// immutable read of the previous one. Neighbor counts at chunk edges read
 /// halo (ghost) cells from the eight adjacent chunks.
+#[derive(Clone)]
 pub struct World {
     chunks: HashMap<ChunkPos, Chunk>,
     pub generation: u64,

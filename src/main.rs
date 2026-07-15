@@ -6,7 +6,7 @@ mod world;
 
 use std::cell::Cell as SharedSlot;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     canvas, div, fill, point, prelude::*, px, rgb, size, App, Application, Bounds, Context,
@@ -21,7 +21,9 @@ use stack::{EditCommand, StackEditor, StackEntry};
 use theme::{themes, Theme};
 use world::World;
 
-const TICK: Duration = Duration::from_millis(80);
+const DEFAULT_TICK_MS: u64 = 80;
+const MIN_TICK_MS: u64 = 10;
+const MAX_TICK_MS: u64 = 1280;
 
 const DURATION_PRESETS: [u32; 9] = [1, 2, 5, 10, 25, 50, 100, 250, 500];
 
@@ -76,6 +78,8 @@ impl Render for DragPreview {
 
 struct SimulatorView {
     world: World,
+    // World state captured by the save button; restore rolls back to it.
+    snapshot: Option<World>,
     camera: Camera,
     rules: Vec<NamedRule>,
     rule_index: usize,
@@ -84,6 +88,13 @@ struct SimulatorView {
     editor: StackEditor,
     stack_enabled: bool,
     running: bool,
+    // Simulation pacing and health metrics.
+    tick_ms: u64,
+    // Exponential moving averages so the readouts don't flicker.
+    step_ms_ema: f64,
+    rate_ema: f64,
+    last_step: Option<Instant>,
+    pop_delta: i64,
     // While the mouse is held on the canvas, the cell value being painted:
     // alive if the stroke started on a dead cell, dead otherwise.
     painting: Option<bool>,
@@ -104,21 +115,21 @@ impl SimulatorView {
         window.focus(&focus_handle);
 
         cx.spawn(async move |this, cx| loop {
-            Timer::after(TICK).await;
-            let alive = this.update(cx, |this, cx| {
+            let Ok(tick_ms) = this.update(cx, |this, cx| {
                 if this.running {
-                    this.world.step(this.current_rule());
-                    cx.notify();
+                    this.step_timed(cx);
                 }
-            });
-            if alive.is_err() {
+                this.tick_ms
+            }) else {
                 break;
-            }
+            };
+            Timer::after(Duration::from_millis(tick_ms)).await;
         })
         .detach();
 
         Self {
             world,
+            snapshot: None,
             camera: Camera::default(),
             rules: builtin_rules(),
             rule_index: 0,
@@ -127,6 +138,11 @@ impl SimulatorView {
             editor: StackEditor::default(),
             stack_enabled: false,
             running: true,
+            tick_ms: DEFAULT_TICK_MS,
+            step_ms_ema: 0.,
+            rate_ema: 0.,
+            last_step: None,
+            pop_delta: 0,
             painting: None,
             pan_last: None,
             focus_handle,
@@ -179,6 +195,41 @@ impl SimulatorView {
             .randomize_region(min_x, min_y, max_x, max_y, 0.2, &mut rand::rng());
     }
 
+    /// Step the world once, updating the health metrics shown in the top bar.
+    fn step_timed(&mut self, cx: &mut Context<Self>) {
+        let ema = |old: f64, new: f64| {
+            if old == 0. {
+                new
+            } else {
+                old * 0.8 + new * 0.2
+            }
+        };
+        if let Some(last) = self.last_step {
+            self.rate_ema = ema(self.rate_ema, 1. / last.elapsed().as_secs_f64().max(1e-6));
+        }
+        self.last_step = Some(Instant::now());
+
+        let population_before = self.world.population() as i64;
+        let start = Instant::now();
+        self.world.step(self.current_rule());
+        self.step_ms_ema = ema(self.step_ms_ema, start.elapsed().as_secs_f64() * 1000.);
+        self.pop_delta = self.world.population() as i64 - population_before;
+        cx.notify();
+    }
+
+    fn save_snapshot(&mut self) {
+        self.snapshot = Some(self.world.clone());
+    }
+
+    fn restore_snapshot(&mut self) -> bool {
+        if let Some(snapshot) = &self.snapshot {
+            self.world = snapshot.clone();
+            true
+        } else {
+            false
+        }
+    }
+
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         if keystroke.modifiers.platform {
@@ -196,9 +247,17 @@ impl SimulatorView {
         const PAN_STEP: f64 = 60.;
         match keystroke.key.as_str() {
             "space" => self.running = !self.running,
-            "n" => self.world.step(self.current_rule()),
+            "n" => self.step_timed(cx),
+            "," => self.tick_ms = (self.tick_ms * 2).min(MAX_TICK_MS),
+            "." => self.tick_ms = (self.tick_ms / 2).max(MIN_TICK_MS),
             "r" => self.randomize_visible(),
             "c" => self.world.clear(),
+            "s" => self.save_snapshot(),
+            "b" => {
+                if !self.restore_snapshot() {
+                    return;
+                }
+            }
             "[" => {
                 self.rule_index = (self.rule_index + self.rules.len() - 1) % self.rules.len();
             }
@@ -602,46 +661,157 @@ impl Render for SimulatorView {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event, _, cx| this.on_key(event, cx)))
             .child(
+                // Row 1: live metrics. Each stat sits in a fixed-width slot
+                // so the row doesn't shift as the numbers change.
                 div()
-                    .h(px(36.))
+                    .h(px(30.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .text_color(rgb(t.text))
+                    .child(div().min_w(px(110.)).child(format!(
+                        "gen {}",
+                        self.world.generation
+                    )))
+                    .child(div().min_w(px(150.)).child(format!(
+                        "pop {} ({:+})",
+                        self.world.population(),
+                        self.pop_delta
+                    )))
+                    .child(div().min_w(px(90.)).child(format!(
+                        "chunks {}",
+                        self.world.chunk_count()
+                    )))
+                    .child(
+                        div()
+                            .min_w(px(90.))
+                            .child(format!("{:.1} gen/s", self.rate_ema)),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(100.))
+                            .child(format!("step {:.1}ms", self.step_ms_ema)),
+                    )
+                    .child({
+                        // Health: how much of the tick budget a step consumes.
+                        let load = 100. * self.step_ms_ema / self.tick_ms as f64;
+                        div()
+                            .min_w(px(80.))
+                            .text_color(rgb(if load < 70. { t.accent } else { 0xd9534f }))
+                            .child(format!("load {load:.0}%"))
+                    }),
+            )
+            .child(
+                // Row 2: state and controls that rarely change.
+                div()
+                    .h(px(30.))
                     .px_3()
                     .flex()
                     .items_center()
                     .gap_4()
                     .text_sm()
                     .text_color(rgb(t.text))
-                    .child(if self.running {
+                    .child(div().min_w(px(70.)).child(if self.running {
                         "▶ running"
                     } else {
                         "⏸ paused"
-                    })
-                    .child(format!("gen {}", self.world.generation))
-                    .child(format!("pop {}", self.world.population()))
-                    .child(format!("chunks {}", self.world.chunk_count()))
+                    }))
                     .child(format!("{:.1}×", self.camera.zoom))
-                    .child(rule_label)
-                    .child(div().flex_1().text_right().child(
-                        "space pause · n step · r randomize · c clear · scroll zoom · middle-drag pan · arrows pan · 0 reset · t theme",
-                    ))
                     .child(
-                        div().flex().items_center().gap_1().children(
-                            self.themes.iter().enumerate().map(|(index, theme)| {
-                                let selected = index == self.theme_index;
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
                                 div()
-                                    .id(SharedString::from(theme.name))
-                                    .size(px(14.))
-                                    .rounded_full()
+                                    .id("speed-down")
+                                    .px_1()
+                                    .rounded_sm()
                                     .cursor_pointer()
-                                    .bg(rgb(theme.accent))
-                                    .border_2()
-                                    .border_color(rgb(if selected { t.text } else { t.bg }))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.theme_index = index;
+                                    .bg(rgb(t.chip_bg))
+                                    .hover(move |el| el.text_color(rgb(t.accent)))
+                                    .child("−")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.tick_ms = (this.tick_ms * 2).min(MAX_TICK_MS);
                                         cx.notify();
-                                    }))
-                            }),
-                        ),
-                    ),
+                                    })),
+                            )
+                            .child(div().min_w(px(36.)).text_center().child(format!(
+                                "{:.0}/s",
+                                1000. / self.tick_ms as f64
+                            )))
+                            .child(
+                                div()
+                                    .id("speed-up")
+                                    .px_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .bg(rgb(t.chip_bg))
+                                    .hover(move |el| el.text_color(rgb(t.accent)))
+                                    .child("+")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.tick_ms = (this.tick_ms / 2).max(MIN_TICK_MS);
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(div().flex_1().child(rule_label))
+                    .child(
+                        div()
+                            .id("save-state")
+                            .px_2()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .bg(rgb(t.chip_bg))
+                            .hover(move |el| el.text_color(rgb(t.accent)))
+                            .child("⬇ save")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.save_snapshot();
+                                cx.notify();
+                            })),
+                    )
+                    .child({
+                        let has_snapshot = self.snapshot.is_some();
+                        let label = match &self.snapshot {
+                            Some(snapshot) => format!("⟲ gen {}", snapshot.generation),
+                            None => "⟲ restore".to_string(),
+                        };
+                        div()
+                            .id("restore-state")
+                            .px_2()
+                            .rounded_sm()
+                            .bg(rgb(t.chip_bg))
+                            .text_color(rgb(if has_snapshot { t.text } else { t.text_dim }))
+                            .when(has_snapshot, move |el| {
+                                el.cursor_pointer()
+                                    .hover(move |el| el.text_color(rgb(t.accent)))
+                            })
+                            .child(label)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.restore_snapshot() {
+                                    cx.notify();
+                                }
+                            }))
+                    })
+                    .child(div().flex().items_center().gap_1().children(
+                        self.themes.iter().enumerate().map(|(index, theme)| {
+                            let selected = index == self.theme_index;
+                            div()
+                                .id(SharedString::from(theme.name))
+                                .size(px(14.))
+                                .rounded_full()
+                                .cursor_pointer()
+                                .bg(rgb(theme.accent))
+                                .border_2()
+                                .border_color(rgb(if selected { t.text } else { t.bg }))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.theme_index = index;
+                                    cx.notify();
+                                }))
+                        }),
+                    )),
             )
             .child(
                 div()
@@ -685,9 +855,8 @@ impl Render for SimulatorView {
                                         let cell = camera.zoom as f32;
                                         let gap = if cell >= 3. { 1. } else { 0. };
                                         for (x, y) in live {
-                                            let (sx, sy) = camera.world_to_screen(
-                                                x as f64, y as f64, w, h,
-                                            );
+                                            let (sx, sy) =
+                                                camera.world_to_screen(x as f64, y as f64, w, h);
                                             let cell_bounds = Bounds {
                                                 origin: point(
                                                     bounds.origin.x + px(sx as f32),
@@ -695,10 +864,8 @@ impl Render for SimulatorView {
                                                 ),
                                                 size: size(px(cell - gap), px(cell - gap)),
                                             };
-                                            window.paint_quad(fill(
-                                                cell_bounds,
-                                                t.cell_color(x, y),
-                                            ));
+                                            window
+                                                .paint_quad(fill(cell_bounds, t.cell_color(x, y)));
                                         }
                                     },
                                 )
@@ -715,6 +882,21 @@ impl Render for SimulatorView {
                             .gap_2()
                             .child(self.render_rules_panel(cx))
                             .child(self.render_stack_panel(cx)),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(26.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(rgb(t.text_dim))
+                    .child(
+                        "space pause · n step · , . speed · r randomize · c clear · s save · b back · \
+                         scroll zoom · middle-drag pan · arrows pan · 0 reset camera · \
+                         [ ] rule · t theme · drag paint · ⌘Z undo stack edit",
                     ),
             )
     }
