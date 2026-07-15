@@ -1,0 +1,20 @@
+[package]
+name = "automata"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# runtime_shaders: compile Metal shaders at runtime instead of via `xcrun
+# metal` at build time, so the build works inside the Nix shell without the
+# Xcode Metal toolchain.
+gpui = { version = "0.2", features = ["runtime_shaders"] }
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.dev]
+# GPUI is slow in unoptimized builds; keep deps optimized.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
