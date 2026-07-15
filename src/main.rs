@@ -1,7 +1,8 @@
-mod life;
+mod camera;
 mod rule;
 mod stack;
 mod theme;
+mod world;
 
 use std::cell::Cell as SharedSlot;
 use std::rc::Rc;
@@ -10,16 +11,16 @@ use std::time::Duration;
 use gpui::{
     canvas, div, fill, point, prelude::*, px, rgb, size, App, Application, Bounds, Context,
     FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point,
-    SharedString, Timer, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    ScrollDelta, ScrollWheelEvent, SharedString, Timer, TitlebarOptions, Window, WindowBounds,
+    WindowOptions,
 };
 
-use life::LifeGrid;
+use camera::Camera;
 use rule::{builtin_rules, BsRule, NamedRule};
 use stack::{EditCommand, StackEditor, StackEntry};
 use theme::{themes, Theme};
+use world::World;
 
-const GRID_WIDTH: usize = 120;
-const GRID_HEIGHT: usize = 80;
 const TICK: Duration = Duration::from_millis(80);
 
 const DURATION_PRESETS: [u32; 9] = [1, 2, 5, 10, 25, 50, 100, 250, 500];
@@ -39,18 +40,6 @@ fn prev_preset(current: u32) -> u32 {
         .copied()
         .find(|&p| p < current)
         .unwrap_or(current)
-}
-
-/// Fit a `cols` x `rows` grid inside `bounds`, centered. Returns the grid's
-/// top-left corner and the cell edge length in pixels.
-fn cell_geometry(bounds: Bounds<Pixels>, cols: usize, rows: usize) -> (Point<Pixels>, f32) {
-    let cell = (f32::from(bounds.size.width) / cols as f32)
-        .min(f32::from(bounds.size.height) / rows as f32);
-    let origin = point(
-        bounds.origin.x + px((f32::from(bounds.size.width) - cell * cols as f32) / 2.),
-        bounds.origin.y + px((f32::from(bounds.size.height) - cell * rows as f32) / 2.),
-    );
-    (origin, cell)
 }
 
 /// Payload for dragging a rule out of the library into the stack.
@@ -86,7 +75,8 @@ impl Render for DragPreview {
 }
 
 struct SimulatorView {
-    grid: LifeGrid,
+    world: World,
+    camera: Camera,
     rules: Vec<NamedRule>,
     rule_index: usize,
     themes: Vec<Theme>,
@@ -97,16 +87,18 @@ struct SimulatorView {
     // While the mouse is held on the canvas, the cell value being painted:
     // alive if the stroke started on a dead cell, dead otherwise.
     painting: Option<bool>,
+    // Last mouse position while panning with the middle button.
+    pan_last: Option<Point<Pixels>>,
     focus_handle: FocusHandle,
     // Written by the canvas prepaint closure each frame, read by the mouse
-    // handlers to map window coordinates back to grid cells.
+    // handlers to map window coordinates back to world cells.
     canvas_bounds: Rc<SharedSlot<Bounds<Pixels>>>,
 }
 
 impl SimulatorView {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut grid = LifeGrid::new(GRID_WIDTH, GRID_HEIGHT);
-        grid.randomize(0.2, &mut rand::rng());
+        let mut world = World::new();
+        world.randomize_region(-70, -45, 70, 45, 0.2, &mut rand::rng());
 
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
@@ -115,7 +107,7 @@ impl SimulatorView {
             Timer::after(TICK).await;
             let alive = this.update(cx, |this, cx| {
                 if this.running {
-                    this.grid.step(this.current_rule());
+                    this.world.step(this.current_rule());
                     cx.notify();
                 }
             });
@@ -126,7 +118,8 @@ impl SimulatorView {
         .detach();
 
         Self {
-            grid,
+            world,
+            camera: Camera::default(),
             rules: builtin_rules(),
             rule_index: 0,
             themes: themes(),
@@ -135,6 +128,7 @@ impl SimulatorView {
             stack_enabled: false,
             running: true,
             painting: None,
+            pan_last: None,
             focus_handle,
             canvas_bounds: Rc::new(SharedSlot::new(Bounds::default())),
         }
@@ -148,13 +142,41 @@ impl SimulatorView {
         if !self.stack_enabled {
             return None;
         }
-        self.editor.stack.entry_at(self.grid.generation)
+        self.editor.stack.entry_at(self.world.generation)
     }
 
     fn current_rule(&self) -> BsRule {
         self.active_stack_entry()
             .map(|(_, entry)| entry.rule)
             .unwrap_or(self.rules[self.rule_index].rule)
+    }
+
+    fn canvas_size(&self) -> (f64, f64) {
+        let bounds = self.canvas_bounds.get();
+        (
+            f32::from(bounds.size.width) as f64,
+            f32::from(bounds.size.height) as f64,
+        )
+    }
+
+    /// Randomize the cells currently on screen (capped so an extreme
+    /// zoom-out doesn't allocate millions of cells).
+    fn randomize_visible(&mut self) {
+        let (w, h) = self.canvas_size();
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = self.camera.visible_world_rect(w, h);
+        const MAX_SPAN: i64 = 600;
+        if max_x - min_x > MAX_SPAN {
+            let cx = (min_x + max_x) / 2;
+            min_x = cx - MAX_SPAN / 2;
+            max_x = cx + MAX_SPAN / 2;
+        }
+        if max_y - min_y > MAX_SPAN {
+            let cy = (min_y + max_y) / 2;
+            min_y = cy - MAX_SPAN / 2;
+            max_y = cy + MAX_SPAN / 2;
+        }
+        self.world
+            .randomize_region(min_x, min_y, max_x, max_y, 0.2, &mut rand::rng());
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -170,50 +192,84 @@ impl SimulatorView {
             }
             return;
         }
+        let (w, h) = self.canvas_size();
+        const PAN_STEP: f64 = 60.;
         match keystroke.key.as_str() {
             "space" => self.running = !self.running,
-            "n" => self.grid.step(self.current_rule()),
-            "r" => self.grid.randomize(0.2, &mut rand::rng()),
-            "c" => self.grid.clear(),
+            "n" => self.world.step(self.current_rule()),
+            "r" => self.randomize_visible(),
+            "c" => self.world.clear(),
             "[" => {
                 self.rule_index = (self.rule_index + self.rules.len() - 1) % self.rules.len();
             }
             "]" => self.rule_index = (self.rule_index + 1) % self.rules.len(),
             "t" => self.theme_index = (self.theme_index + 1) % self.themes.len(),
+            "left" => self.camera.pan_pixels(-PAN_STEP, 0.),
+            "right" => self.camera.pan_pixels(PAN_STEP, 0.),
+            "up" => self.camera.pan_pixels(0., -PAN_STEP),
+            "down" => self.camera.pan_pixels(0., PAN_STEP),
+            "-" => self.camera.zoom_by(1. / 1.25, w / 2., h / 2., w, h),
+            "=" => self.camera.zoom_by(1.25, w / 2., h / 2., w, h),
+            "0" => self.camera = Camera::default(),
             _ => return,
         }
         cx.notify();
     }
 
-    fn cell_at(&self, position: Point<Pixels>) -> Option<(usize, usize)> {
-        let (origin, cell) =
-            cell_geometry(self.canvas_bounds.get(), self.grid.width, self.grid.height);
-        let x = (f32::from(position.x - origin.x) / cell).floor();
-        let y = (f32::from(position.y - origin.y) / cell).floor();
-        (x >= 0. && y >= 0. && (x as usize) < self.grid.width && (y as usize) < self.grid.height)
-            .then_some((x as usize, y as usize))
+    fn cell_at(&self, position: Point<Pixels>) -> (i64, i64) {
+        let bounds = self.canvas_bounds.get();
+        let (w, h) = self.canvas_size();
+        let sx = f32::from(position.x - bounds.origin.x) as f64;
+        let sy = f32::from(position.y - bounds.origin.y) as f64;
+        let (wx, wy) = self.camera.screen_to_world(sx, sy, w, h);
+        (wx.floor() as i64, wy.floor() as i64)
     }
 
     fn begin_paint(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        if let Some((x, y)) = self.cell_at(event.position) {
-            let value = !self.grid.get(x, y);
-            self.painting = Some(value);
-            self.grid.set(x, y, value);
-            cx.notify();
-        }
+        let (x, y) = self.cell_at(event.position);
+        let value = !self.world.get(x, y);
+        self.painting = Some(value);
+        self.world.set(x, y, value);
+        cx.notify();
     }
 
     fn continue_paint(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        if event.pressed_button != Some(MouseButton::Left) {
+        match event.pressed_button {
+            Some(MouseButton::Left) => {
+                let Some(value) = self.painting else { return };
+                let (x, y) = self.cell_at(event.position);
+                if self.world.get(x, y) != value {
+                    self.world.set(x, y, value);
+                    cx.notify();
+                }
+            }
+            Some(MouseButton::Middle) => {
+                if let Some(last) = self.pan_last {
+                    let dx = f32::from(last.x - event.position.x) as f64;
+                    let dy = f32::from(last.y - event.position.y) as f64;
+                    self.camera.pan_pixels(dx, dy);
+                    self.pan_last = Some(event.position);
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let dy = match event.delta {
+            ScrollDelta::Pixels(delta) => f32::from(delta.y) as f64,
+            ScrollDelta::Lines(delta) => delta.y as f64 * 24.,
+        };
+        if dy == 0. {
             return;
         }
-        let Some(value) = self.painting else { return };
-        if let Some((x, y)) = self.cell_at(event.position) {
-            if self.grid.get(x, y) != value {
-                self.grid.set(x, y, value);
-                cx.notify();
-            }
-        }
+        let bounds = self.canvas_bounds.get();
+        let (w, h) = self.canvas_size();
+        let sx = f32::from(event.position.x - bounds.origin.x) as f64;
+        let sy = f32::from(event.position.y - bounds.origin.y) as f64;
+        self.camera.zoom_by((dy / 160.).exp2(), sx, sy, w, h);
+        cx.notify();
     }
 
     /// Move a stack entry so it sits where the drop landed, accounting for
@@ -241,6 +297,55 @@ impl SimulatorView {
         });
         self.stack_enabled = true;
         cx.notify();
+    }
+
+    fn render_rules_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = self.theme();
+        div()
+            .p_2()
+            .rounded_md()
+            .bg(rgb(t.panel_bg))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .text_sm()
+            .child(div().text_color(rgb(t.text)).child("Rule Library"))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(self.rules.iter().enumerate().map(|(index, named)| {
+                        let selected =
+                            index == self.rule_index && self.active_stack_entry().is_none();
+                        let dragged = DraggedRule {
+                            name: named.name,
+                            rule: named.rule,
+                        };
+                        div()
+                            .id(SharedString::from(named.name))
+                            .px_2()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(rgb(if selected { t.accent } else { t.text }))
+                            .when(selected, |el| el.bg(rgb(t.canvas_bg)))
+                            .hover(move |el| el.bg(rgb(t.canvas_bg)))
+                            .child(named.name)
+                            .on_drag(dragged, {
+                                let name = SharedString::from(named.name);
+                                move |_, _, _, cx| {
+                                    cx.new(|_| DragPreview {
+                                        label: name.clone(),
+                                        theme: t,
+                                    })
+                                }
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.rule_index = index;
+                                cx.notify();
+                            }))
+                    })),
+            )
     }
 
     fn render_stack_entry(
@@ -369,13 +474,11 @@ impl SimulatorView {
         };
 
         div()
-            .w(px(280.))
+            .flex_1()
             .flex()
             .flex_col()
             .gap_2()
             .p_2()
-            .m_2()
-            .ml_0()
             .rounded_md()
             .bg(rgb(t.panel_bg))
             .text_sm()
@@ -410,7 +513,11 @@ impl SimulatorView {
                             .rounded_sm()
                             .cursor_pointer()
                             .bg(rgb(t.chip_bg))
-                            .text_color(rgb(if self.stack_enabled { t.accent } else { t.text_dim }))
+                            .text_color(rgb(if self.stack_enabled {
+                                t.accent
+                            } else {
+                                t.text_dim
+                            }))
                             .child(if self.stack_enabled { "on" } else { "off" })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.stack_enabled = !this.stack_enabled;
@@ -463,18 +570,14 @@ impl SimulatorView {
 
 impl Render for SimulatorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (cols, rows) = (self.grid.width, self.grid.height);
-        let mut live = Vec::new();
-        for y in 0..rows {
-            for x in 0..cols {
-                if self.grid.get(x, y) {
-                    live.push((x, y));
-                }
-            }
-        }
-        let population = live.len();
-        let bounds_slot = self.canvas_bounds.clone();
         let t = self.theme();
+        let camera = self.camera;
+        let bounds_slot = self.canvas_bounds.clone();
+
+        // Visible-region query: only cells on screen are collected and drawn.
+        let (w, h) = self.canvas_size();
+        let (min_x, min_y, max_x, max_y) = camera.visible_world_rect(w, h);
+        let live = self.world.live_cells_in(min_x, min_y, max_x, max_y);
 
         let rule_label = match self.active_stack_entry() {
             Some((index, entry)) => format!(
@@ -512,11 +615,13 @@ impl Render for SimulatorView {
                     } else {
                         "⏸ paused"
                     })
-                    .child(format!("gen {}", self.grid.generation))
-                    .child(format!("pop {population}"))
+                    .child(format!("gen {}", self.world.generation))
+                    .child(format!("pop {}", self.world.population()))
+                    .child(format!("chunks {}", self.world.chunk_count()))
+                    .child(format!("{:.1}×", self.camera.zoom))
                     .child(rule_label)
                     .child(div().flex_1().text_right().child(
-                        "space pause · n step · r randomize · c clear · [ ] rule · t theme · drag paint · ⌘Z undo",
+                        "space pause · n step · r randomize · c clear · scroll zoom · middle-drag pan · arrows pan · 0 reset · t theme",
                     ))
                     .child(
                         div().flex().items_center().gap_1().children(
@@ -540,44 +645,6 @@ impl Render for SimulatorView {
             )
             .child(
                 div()
-                    .px_3()
-                    .pb_1()
-                    .flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .text_sm()
-                    .children(self.rules.iter().enumerate().map(|(index, named)| {
-                        let selected = index == self.rule_index && self.active_stack_entry().is_none();
-                        let dragged = DraggedRule {
-                            name: named.name,
-                            rule: named.rule,
-                        };
-                        div()
-                            .id(SharedString::from(named.name))
-                            .px_2()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_color(rgb(if selected { t.accent } else { t.text }))
-                            .when(selected, |el| el.bg(rgb(t.canvas_bg)))
-                            .hover(move |el| el.bg(rgb(t.canvas_bg)))
-                            .child(named.name)
-                            .on_drag(dragged, {
-                                let name = SharedString::from(named.name);
-                                move |_, _, _, cx| {
-                                    cx.new(|_| DragPreview {
-                                        label: name.clone(),
-                                        theme: t,
-                                    })
-                                }
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.rule_index = index;
-                                cx.notify();
-                            }))
-                    })),
-            )
-            .child(
-                div()
                     .flex_1()
                     .flex()
                     .child(
@@ -588,6 +655,12 @@ impl Render for SimulatorView {
                                 MouseButton::Left,
                                 cx.listener(|this, event, _, cx| this.begin_paint(event, cx)),
                             )
+                            .on_mouse_down(
+                                MouseButton::Middle,
+                                cx.listener(|this, event: &MouseDownEvent, _, _| {
+                                    this.pan_last = Some(event.position);
+                                }),
+                            )
                             .on_mouse_move(
                                 cx.listener(|this, event, _, cx| this.continue_paint(event, cx)),
                             )
@@ -595,24 +668,36 @@ impl Render for SimulatorView {
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, _| this.painting = None),
                             )
+                            .on_mouse_up(
+                                MouseButton::Middle,
+                                cx.listener(|this, _, _, _| this.pan_last = None),
+                            )
+                            .on_scroll_wheel(
+                                cx.listener(|this, event, _, cx| this.on_scroll(event, cx)),
+                            )
                             .child(
                                 canvas(
                                     move |bounds, _, _| bounds_slot.set(bounds),
                                     move |bounds, _, window, _| {
                                         window.paint_quad(fill(bounds, rgb(t.canvas_bg)));
-                                        let (origin, cell) = cell_geometry(bounds, cols, rows);
+                                        let w = f32::from(bounds.size.width) as f64;
+                                        let h = f32::from(bounds.size.height) as f64;
+                                        let cell = camera.zoom as f32;
                                         let gap = if cell >= 3. { 1. } else { 0. };
                                         for (x, y) in live {
+                                            let (sx, sy) = camera.world_to_screen(
+                                                x as f64, y as f64, w, h,
+                                            );
                                             let cell_bounds = Bounds {
                                                 origin: point(
-                                                    origin.x + px(x as f32 * cell),
-                                                    origin.y + px(y as f32 * cell),
+                                                    bounds.origin.x + px(sx as f32),
+                                                    bounds.origin.y + px(sy as f32),
                                                 ),
                                                 size: size(px(cell - gap), px(cell - gap)),
                                             };
                                             window.paint_quad(fill(
                                                 cell_bounds,
-                                                t.cell_color(x, y, cols, rows),
+                                                t.cell_color(x, y),
                                             ));
                                         }
                                     },
@@ -620,7 +705,17 @@ impl Render for SimulatorView {
                                 .size_full(),
                             ),
                     )
-                    .child(self.render_stack_panel(cx)),
+                    .child(
+                        div()
+                            .w(px(300.))
+                            .m_2()
+                            .ml_0()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(self.render_rules_panel(cx))
+                            .child(self.render_stack_panel(cx)),
+                    ),
             )
     }
 }

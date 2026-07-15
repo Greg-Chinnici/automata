@@ -27,12 +27,15 @@ pub struct Theme {
 }
 
 impl Theme {
-    pub fn cell_color(&self, x: usize, y: usize, cols: usize, rows: usize) -> Hsla {
+    pub fn cell_color(&self, x: i64, y: i64) -> Hsla {
         match self.cell_style {
             CellStyle::Solid => rgb(self.accent).into(),
             CellStyle::Rainbow => {
-                let hue = 0.5 * (x as f32 / cols as f32 + y as f32 / rows as f32);
-                hsla(hue, 0.85, 0.62, 1.0)
+                // Diagonal hue sweep repeating every PERIOD cells, stable
+                // across the infinite plane (rem_euclid handles negatives).
+                const PERIOD: i64 = 160;
+                let phase = (x + y).rem_euclid(PERIOD);
+                hsla(phase as f32 / PERIOD as f32, 0.85, 0.62, 1.0)
             }
         }
     }
@@ -146,8 +149,8 @@ mod tests {
             .into_iter()
             .find(|t| t.cell_style == CellStyle::Rainbow)
             .unwrap();
-        for (x, y) in [(0, 0), (119, 79), (60, 40)] {
-            let color = rainbow.cell_color(x, y, 120, 80);
+        for (x, y) in [(0, 0), (119, 79), (-500, 40), (i64::MAX / 4, -3)] {
+            let color = rainbow.cell_color(x, y);
             assert!(
                 (0.0..=1.0).contains(&color.h),
                 "hue {} out of range",

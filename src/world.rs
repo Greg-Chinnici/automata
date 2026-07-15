@@ -267,7 +267,10 @@ mod tests {
     #[test]
     fn block_is_still_life_at_negative_coordinates() {
         let mut world = World::new();
-        set_all(&mut world, &[(-70, -70), (-69, -70), (-70, -69), (-69, -69)]);
+        set_all(
+            &mut world,
+            &[(-70, -70), (-69, -70), (-70, -69), (-69, -69)],
+        );
         let before = live_cells(&world);
         world.step(life());
         assert_eq!(live_cells(&world), before);
@@ -279,13 +282,19 @@ mod tests {
         // moved (+4,+4) and crossed into neighboring chunks.
         let mut world = World::new();
         set_all(&mut world, &glider(60, 60));
-        for _ in 0..16 {
+        for _ in 0..8 {
+            world.step(life());
+        }
+        assert!(
+            world.chunk_count() > 1,
+            "mid-crossing, the glider straddles the boundary"
+        );
+        for _ in 0..8 {
             world.step(life());
         }
         let mut expected = glider(64, 64);
         expected.sort();
         assert_eq!(live_cells(&world), expected);
-        assert!(world.chunk_count() > 1, "glider now spans multiple chunks");
     }
 
     #[test]
@@ -329,8 +338,14 @@ mod tests {
         assert_eq!(live_cells(&world).len(), 4, "block stable under Life");
         world.step(BsRule::parse("B2/S").unwrap());
         let after = live_cells(&world);
-        assert!(!after.contains(&(2, 2)), "live cells never survive in Seeds");
-        assert!(after.contains(&(1, 2)), "cells born where two neighbors meet");
+        assert!(
+            !after.contains(&(2, 2)),
+            "live cells never survive in Seeds"
+        );
+        assert!(
+            after.contains(&(1, 2)),
+            "cells born where two neighbors meet"
+        );
     }
 
     #[test]
