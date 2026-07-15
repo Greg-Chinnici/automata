@@ -1,6 +1,7 @@
 mod life;
 mod rule;
 mod stack;
+mod theme;
 
 use std::cell::Cell as SharedSlot;
 use std::rc::Rc;
@@ -15,18 +16,11 @@ use gpui::{
 use life::LifeGrid;
 use rule::{builtin_rules, BsRule, NamedRule};
 use stack::{EditCommand, StackEditor, StackEntry};
+use theme::{themes, Theme};
 
 const GRID_WIDTH: usize = 120;
 const GRID_HEIGHT: usize = 80;
 const TICK: Duration = Duration::from_millis(80);
-
-const BG: u32 = 0x14141a;
-const CANVAS_BG: u32 = 0x0b0b10;
-const PANEL_BG: u32 = 0x101016;
-const CHIP_BG: u32 = 0x1d1d26;
-const CELL_COLOR: u32 = 0x5be37d;
-const TEXT_COLOR: u32 = 0x9aa0b0;
-const TEXT_DIM: u32 = 0x565c68;
 
 const DURATION_PRESETS: [u32; 9] = [1, 2, 5, 10, 25, 50, 100, 250, 500];
 
@@ -73,18 +67,21 @@ struct DraggedEntry {
 }
 
 /// The floating chip rendered under the cursor while dragging.
-struct DragPreview(SharedString);
+struct DragPreview {
+    label: SharedString,
+    theme: Theme,
+}
 
 impl Render for DragPreview {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
             .px_2()
             .py_1()
-            .bg(rgb(CHIP_BG))
+            .bg(rgb(self.theme.chip_bg))
             .rounded_sm()
             .text_sm()
-            .text_color(rgb(CELL_COLOR))
-            .child(self.0.clone())
+            .text_color(rgb(self.theme.accent))
+            .child(self.label.clone())
     }
 }
 
@@ -92,6 +89,8 @@ struct SimulatorView {
     grid: LifeGrid,
     rules: Vec<NamedRule>,
     rule_index: usize,
+    themes: Vec<Theme>,
+    theme_index: usize,
     editor: StackEditor,
     stack_enabled: bool,
     running: bool,
@@ -130,6 +129,8 @@ impl SimulatorView {
             grid,
             rules: builtin_rules(),
             rule_index: 0,
+            themes: themes(),
+            theme_index: 0,
             editor: StackEditor::default(),
             stack_enabled: false,
             running: true,
@@ -137,6 +138,10 @@ impl SimulatorView {
             focus_handle,
             canvas_bounds: Rc::new(SharedSlot::new(Bounds::default())),
         }
+    }
+
+    fn theme(&self) -> Theme {
+        self.themes[self.theme_index]
     }
 
     fn active_stack_entry(&self) -> Option<(usize, &StackEntry)> {
@@ -174,6 +179,7 @@ impl SimulatorView {
                 self.rule_index = (self.rule_index + self.rules.len() - 1) % self.rules.len();
             }
             "]" => self.rule_index = (self.rule_index + 1) % self.rules.len(),
+            "t" => self.theme_index = (self.theme_index + 1) % self.themes.len(),
             _ => return,
         }
         cx.notify();
@@ -244,16 +250,17 @@ impl SimulatorView {
         active: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let t = self.theme();
         let generations = entry.generations;
         let removed = entry.clone();
-        let button = |id: SharedString, label: &'static str| {
+        let button = move |id: SharedString, label: &'static str| {
             div()
                 .id(id)
                 .px_1()
                 .rounded_sm()
                 .cursor_pointer()
-                .text_color(rgb(TEXT_COLOR))
-                .hover(|el| el.bg(rgb(CHIP_BG)).text_color(rgb(CELL_COLOR)))
+                .text_color(rgb(t.text))
+                .hover(move |el| el.bg(rgb(t.chip_bg)).text_color(rgb(t.accent)))
                 .child(label)
         };
 
@@ -265,27 +272,32 @@ impl SimulatorView {
             .items_center()
             .gap_1()
             .rounded_sm()
-            .bg(rgb(CHIP_BG))
+            .bg(rgb(t.chip_bg))
             .border_1()
-            .border_color(rgb(if active { CELL_COLOR } else { CHIP_BG }))
+            .border_color(rgb(if active { t.accent } else { t.chip_bg }))
             .cursor_move()
             .on_drag(DraggedEntry { index }, {
                 let name = SharedString::from(entry.name.clone());
-                move |_, _, _, cx| cx.new(|_| DragPreview(name.clone()))
+                move |_, _, _, cx| {
+                    cx.new(|_| DragPreview {
+                        label: name.clone(),
+                        theme: t,
+                    })
+                }
             })
-            .drag_over::<DraggedRule>(|style, _, _, _| style.bg(rgb(0x232331)))
-            .drag_over::<DraggedEntry>(|style, _, _, _| style.bg(rgb(0x232331)))
+            .drag_over::<DraggedRule>(move |style, _, _, _| style.bg(rgb(t.hover_bg)))
+            .drag_over::<DraggedEntry>(move |style, _, _, _| style.bg(rgb(t.hover_bg)))
             .on_drop(cx.listener(move |this, dragged: &DraggedRule, _, cx| {
                 this.insert_rule(index, dragged, cx);
             }))
             .on_drop(cx.listener(move |this, dragged: &DraggedEntry, _, cx| {
                 this.move_entry(dragged.index, index, cx);
             }))
-            .child(div().text_color(rgb(TEXT_DIM)).child("⠿"))
+            .child(div().text_color(rgb(t.text_dim)).child("⠿"))
             .child(
                 div()
                     .flex_1()
-                    .text_color(rgb(TEXT_COLOR))
+                    .text_color(rgb(t.text))
                     .child(entry.name.clone()),
             )
             .child(
@@ -307,7 +319,7 @@ impl SimulatorView {
                 div()
                     .min_w(px(44.))
                     .text_center()
-                    .text_color(rgb(CELL_COLOR))
+                    .text_color(rgb(t.accent))
                     .child(format!("{generations} gen")),
             )
             .child(
@@ -339,18 +351,19 @@ impl SimulatorView {
     }
 
     fn render_stack_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = self.theme();
         let active_index = self.active_stack_entry().map(|(index, _)| index);
         let entry_count = self.editor.stack.entries.len();
 
-        let header_button = |id: &'static str, label: &'static str, enabled: bool| {
+        let header_button = move |id: &'static str, label: &'static str, enabled: bool| {
             div()
                 .id(id)
                 .px_1()
                 .rounded_sm()
-                .text_color(rgb(if enabled { TEXT_COLOR } else { TEXT_DIM }))
-                .when(enabled, |el| {
+                .text_color(rgb(if enabled { t.text } else { t.text_dim }))
+                .when(enabled, move |el| {
                     el.cursor_pointer()
-                        .hover(|el| el.bg(rgb(CHIP_BG)).text_color(rgb(CELL_COLOR)))
+                        .hover(move |el| el.bg(rgb(t.chip_bg)).text_color(rgb(t.accent)))
                 })
                 .child(label)
         };
@@ -364,14 +377,14 @@ impl SimulatorView {
             .m_2()
             .ml_0()
             .rounded_md()
-            .bg(rgb(PANEL_BG))
+            .bg(rgb(t.panel_bg))
             .text_sm()
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().flex_1().text_color(rgb(TEXT_COLOR)).child("Rule Stack"))
+                    .child(div().flex_1().text_color(rgb(t.text)).child("Rule Stack"))
                     .child(
                         header_button("undo", "↩", self.editor.can_undo()).on_click(cx.listener(
                             |this, _, _, cx| {
@@ -396,8 +409,8 @@ impl SimulatorView {
                             .px_2()
                             .rounded_sm()
                             .cursor_pointer()
-                            .bg(rgb(CHIP_BG))
-                            .text_color(rgb(if self.stack_enabled { CELL_COLOR } else { TEXT_DIM }))
+                            .bg(rgb(t.chip_bg))
+                            .text_color(rgb(if self.stack_enabled { t.accent } else { t.text_dim }))
                             .child(if self.stack_enabled { "on" } else { "off" })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.stack_enabled = !this.stack_enabled;
@@ -425,10 +438,14 @@ impl SimulatorView {
                     .rounded_sm()
                     .border_1()
                     .border_dashed()
-                    .border_color(rgb(TEXT_DIM))
-                    .text_color(rgb(TEXT_DIM))
-                    .drag_over::<DraggedRule>(|style, _, _, _| style.border_color(rgb(CELL_COLOR)))
-                    .drag_over::<DraggedEntry>(|style, _, _, _| style.border_color(rgb(CELL_COLOR)))
+                    .border_color(rgb(t.text_dim))
+                    .text_color(rgb(t.text_dim))
+                    .drag_over::<DraggedRule>(move |style, _, _, _| {
+                        style.border_color(rgb(t.accent))
+                    })
+                    .drag_over::<DraggedEntry>(move |style, _, _, _| {
+                        style.border_color(rgb(t.accent))
+                    })
                     .on_drop(cx.listener(move |this, dragged: &DraggedRule, _, cx| {
                         this.insert_rule(entry_count, dragged, cx);
                     }))
@@ -457,6 +474,7 @@ impl Render for SimulatorView {
         }
         let population = live.len();
         let bounds_slot = self.canvas_bounds.clone();
+        let t = self.theme();
 
         let rule_label = match self.active_stack_entry() {
             Some((index, entry)) => format!(
@@ -477,7 +495,7 @@ impl Render for SimulatorView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(BG))
+            .bg(rgb(t.bg))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event, _, cx| this.on_key(event, cx)))
             .child(
@@ -488,7 +506,7 @@ impl Render for SimulatorView {
                     .items_center()
                     .gap_4()
                     .text_sm()
-                    .text_color(rgb(TEXT_COLOR))
+                    .text_color(rgb(t.text))
                     .child(if self.running {
                         "▶ running"
                     } else {
@@ -498,8 +516,27 @@ impl Render for SimulatorView {
                     .child(format!("pop {population}"))
                     .child(rule_label)
                     .child(div().flex_1().text_right().child(
-                        "space pause · n step · r randomize · c clear · [ ] rule · drag paint · ⌘Z undo",
-                    )),
+                        "space pause · n step · r randomize · c clear · [ ] rule · t theme · drag paint · ⌘Z undo",
+                    ))
+                    .child(
+                        div().flex().items_center().gap_1().children(
+                            self.themes.iter().enumerate().map(|(index, theme)| {
+                                let selected = index == self.theme_index;
+                                div()
+                                    .id(SharedString::from(theme.name))
+                                    .size(px(14.))
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .bg(rgb(theme.accent))
+                                    .border_2()
+                                    .border_color(rgb(if selected { t.text } else { t.bg }))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.theme_index = index;
+                                        cx.notify();
+                                    }))
+                            }),
+                        ),
+                    ),
             )
             .child(
                 div()
@@ -520,13 +557,18 @@ impl Render for SimulatorView {
                             .px_2()
                             .rounded_sm()
                             .cursor_pointer()
-                            .text_color(rgb(if selected { CELL_COLOR } else { TEXT_COLOR }))
-                            .when(selected, |el| el.bg(rgb(CANVAS_BG)))
-                            .hover(|el| el.bg(rgb(CANVAS_BG)))
+                            .text_color(rgb(if selected { t.accent } else { t.text }))
+                            .when(selected, |el| el.bg(rgb(t.canvas_bg)))
+                            .hover(move |el| el.bg(rgb(t.canvas_bg)))
                             .child(named.name)
                             .on_drag(dragged, {
                                 let name = SharedString::from(named.name);
-                                move |_, _, _, cx| cx.new(|_| DragPreview(name.clone()))
+                                move |_, _, _, cx| {
+                                    cx.new(|_| DragPreview {
+                                        label: name.clone(),
+                                        theme: t,
+                                    })
+                                }
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.rule_index = index;
@@ -557,7 +599,7 @@ impl Render for SimulatorView {
                                 canvas(
                                     move |bounds, _, _| bounds_slot.set(bounds),
                                     move |bounds, _, window, _| {
-                                        window.paint_quad(fill(bounds, rgb(CANVAS_BG)));
+                                        window.paint_quad(fill(bounds, rgb(t.canvas_bg)));
                                         let (origin, cell) = cell_geometry(bounds, cols, rows);
                                         let gap = if cell >= 3. { 1. } else { 0. };
                                         for (x, y) in live {
@@ -568,7 +610,10 @@ impl Render for SimulatorView {
                                                 ),
                                                 size: size(px(cell - gap), px(cell - gap)),
                                             };
-                                            window.paint_quad(fill(cell_bounds, rgb(CELL_COLOR)));
+                                            window.paint_quad(fill(
+                                                cell_bounds,
+                                                t.cell_color(x, y, cols, rows),
+                                            ));
                                         }
                                     },
                                 )
