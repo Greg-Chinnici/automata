@@ -1,4 +1,6 @@
 mod camera;
+mod material;
+mod physics;
 mod rule;
 mod stack;
 mod theme;
@@ -10,12 +12,14 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     canvas, div, fill, point, prelude::*, px, rgb, size, App, Application, Bounds, Context,
-    ExternalPaths, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels,
-    Point, ScrollDelta, ScrollWheelEvent, SharedString, Timer, TitlebarOptions, Window,
+    ExternalPaths, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString, Timer, TitlebarOptions, Window,
     WindowBounds, WindowOptions,
 };
 
 use camera::Camera;
+use material::{builtin_materials, Material, MaterialId, EMPTY, SAND, STONE, WATER};
+use physics::PhysicsWorld;
 use rule::{builtin_rules, BsRule, NamedRule};
 use stack::{EditCommand, StackEditor, StackEntry};
 use theme::{themes, Theme};
@@ -46,6 +50,14 @@ fn prev_preset(current: Option<u32>) -> Option<u32> {
                 .unwrap_or(current),
         ),
     }
+}
+
+/// Which simulation is active. Both worlds are kept alive; switching modes
+/// just changes which one steps, paints, and renders.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SimMode {
+    CellularAutomaton,
+    Physics,
 }
 
 /// Payload for dragging a rule out of the library into the stack.
@@ -80,10 +92,34 @@ impl Render for DragPreview {
     }
 }
 
+/// Starter physics scene: a stone basin holding a sand mound and a pool of
+/// water, so the mode is immediately alive when switched to.
+fn default_physics_scene() -> PhysicsWorld {
+    let mut world = PhysicsWorld::new();
+    for x in -60..=60 {
+        world.set(x, 42, STONE);
+    }
+    for y in 5..=42 {
+        world.set(-60, y, STONE);
+        world.set(60, y, STONE);
+    }
+    let mut rng = rand::rng();
+    world.sprinkle((-45, 8, -15, 30), SAND, 0.5, &mut rng);
+    world.sprinkle((10, 15, 50, 38), WATER, 0.7, &mut rng);
+    world
+}
+
 struct SimulatorView {
+    mode: SimMode,
     world: World,
+    physics: PhysicsWorld,
     // World state captured by the save button; restore rolls back to it.
+    // One slot per mode so switching modes doesn't clobber the other's save.
     snapshot: Option<World>,
+    physics_snapshot: Option<PhysicsWorld>,
+    materials: Vec<Material>,
+    // The material painted by left-click/drag in physics mode.
+    selected_material: MaterialId,
     camera: Camera,
     rules: Vec<NamedRule>,
     rule_index: usize,
@@ -107,6 +143,8 @@ struct SimulatorView {
     // While the mouse is held on the canvas, the cell value being painted:
     // alive if the stroke started on a dead cell, dead otherwise.
     painting: Option<bool>,
+    // Physics-mode equivalent: the material being stroked (Empty = erasing).
+    paint_material: Option<MaterialId>,
     // Last mouse position while panning with the middle button.
     pan_last: Option<Point<Pixels>>,
     focus_handle: FocusHandle,
@@ -137,8 +175,13 @@ impl SimulatorView {
         .detach();
 
         Self {
+            mode: SimMode::CellularAutomaton,
             world,
+            physics: default_physics_scene(),
             snapshot: None,
+            physics_snapshot: None,
+            materials: builtin_materials(),
+            selected_material: SAND,
             camera: Camera::default(),
             rules: builtin_rules(),
             rule_index: 0,
@@ -155,6 +198,7 @@ impl SimulatorView {
             pop_delta: 0,
             invert_import: false,
             painting: None,
+            paint_material: None,
             pan_last: None,
             focus_handle,
             canvas_bounds: Rc::new(SharedSlot::new(Bounds::default())),
@@ -163,6 +207,27 @@ impl SimulatorView {
 
     fn theme(&self) -> Theme {
         self.themes[self.theme_index]
+    }
+
+    fn active_generation(&self) -> u64 {
+        match self.mode {
+            SimMode::CellularAutomaton => self.world.generation,
+            SimMode::Physics => self.physics.generation,
+        }
+    }
+
+    fn active_population(&self) -> u64 {
+        match self.mode {
+            SimMode::CellularAutomaton => self.world.population(),
+            SimMode::Physics => self.physics.population(),
+        }
+    }
+
+    fn active_chunk_count(&self) -> usize {
+        match self.mode {
+            SimMode::CellularAutomaton => self.world.chunk_count(),
+            SimMode::Physics => self.physics.chunk_count(),
+        }
     }
 
     fn active_stack_entry(&self) -> Option<(usize, &StackEntry)> {
@@ -196,9 +261,9 @@ impl SimulatorView {
         )
     }
 
-    /// Randomize the cells currently on screen (capped so an extreme
-    /// zoom-out doesn't allocate millions of cells).
-    fn randomize_visible(&mut self) {
+    /// Visible world rectangle, capped so an extreme zoom-out doesn't touch
+    /// millions of cells.
+    fn visible_rect_capped(&self) -> (i64, i64, i64, i64) {
         let (w, h) = self.canvas_size();
         let (mut min_x, mut min_y, mut max_x, mut max_y) = self.camera.visible_world_rect(w, h);
         const MAX_SPAN: i64 = 600;
@@ -212,8 +277,32 @@ impl SimulatorView {
             min_y = cy - MAX_SPAN / 2;
             max_y = cy + MAX_SPAN / 2;
         }
-        self.world
-            .randomize_region(min_x, min_y, max_x, max_y, 0.2, &mut rand::rng());
+        (min_x, min_y, max_x, max_y)
+    }
+
+    /// Randomize the cells currently on screen: random live cells in CA
+    /// mode, a sprinkle of the selected material in physics mode.
+    fn randomize_visible(&mut self) {
+        let (min_x, min_y, max_x, max_y) = self.visible_rect_capped();
+        match self.mode {
+            SimMode::CellularAutomaton => {
+                self.world
+                    .randomize_region(min_x, min_y, max_x, max_y, 0.2, &mut rand::rng());
+            }
+            SimMode::Physics => {
+                let material = if self.selected_material == EMPTY {
+                    SAND
+                } else {
+                    self.selected_material
+                };
+                self.physics.sprinkle(
+                    (min_x, min_y, max_x, max_y),
+                    material,
+                    0.2,
+                    &mut rand::rng(),
+                );
+            }
+        }
     }
 
     /// Step the world once, updating the health metrics shown in the top bar.
@@ -230,11 +319,14 @@ impl SimulatorView {
         }
         self.last_step = Some(Instant::now());
 
-        let population_before = self.world.population() as i64;
+        let population_before = self.active_population() as i64;
         let start = Instant::now();
-        self.world.step(self.current_rule());
+        match self.mode {
+            SimMode::CellularAutomaton => self.world.step(self.current_rule()),
+            SimMode::Physics => self.physics.step(&self.materials, &mut rand::rng()),
+        }
         self.step_ms_ema = ema(self.step_ms_ema, start.elapsed().as_secs_f64() * 1000.);
-        self.pop_delta = self.world.population() as i64 - population_before;
+        self.pop_delta = self.active_population() as i64 - population_before;
         cx.notify();
     }
 
@@ -257,11 +349,21 @@ impl SimulatorView {
             let (w, h) = img.dimensions();
             let origin_x = self.camera.center_x.round() as i64 - w as i64 / 2;
             let origin_y = self.camera.center_y.round() as i64 - h as i64 / 2;
+            // In physics mode, stamp with the selected material (stone when
+            // the eraser is selected, so a drop always leaves something).
+            let stamp = if self.selected_material == EMPTY {
+                STONE
+            } else {
+                self.selected_material
+            };
             for (px_x, px_y, pixel) in img.enumerate_pixels() {
                 let [luma, alpha] = pixel.0;
                 if alpha >= 128 && ((luma < 128) != self.invert_import) {
-                    self.world
-                        .set(origin_x + px_x as i64, origin_y + px_y as i64, true);
+                    let (x, y) = (origin_x + px_x as i64, origin_y + px_y as i64);
+                    match self.mode {
+                        SimMode::CellularAutomaton => self.world.set(x, y, true),
+                        SimMode::Physics => self.physics.set(x, y, stamp),
+                    }
                 }
             }
             placed = true;
@@ -272,16 +374,28 @@ impl SimulatorView {
     }
 
     fn save_snapshot(&mut self) {
-        self.snapshot = Some(self.world.clone());
+        match self.mode {
+            SimMode::CellularAutomaton => self.snapshot = Some(self.world.clone()),
+            SimMode::Physics => self.physics_snapshot = Some(self.physics.clone()),
+        }
     }
 
     fn restore_snapshot(&mut self) -> bool {
-        if let Some(snapshot) = &self.snapshot {
-            self.world = snapshot.clone();
-            true
-        } else {
-            false
+        match self.mode {
+            SimMode::CellularAutomaton => {
+                if let Some(snapshot) = &self.snapshot {
+                    self.world = snapshot.clone();
+                    return true;
+                }
+            }
+            SimMode::Physics => {
+                if let Some(snapshot) = &self.physics_snapshot {
+                    self.physics = snapshot.clone();
+                    return true;
+                }
+            }
         }
+        false
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -305,9 +419,18 @@ impl SimulatorView {
             "," => self.tick_ms = (self.tick_ms * 2).min(MAX_TICK_MS),
             "." => self.tick_ms = (self.tick_ms / 2).max(MIN_TICK_MS),
             "r" => self.randomize_visible(),
-            "c" => {
-                self.world.clear();
-                self.stack_origin = 0;
+            "c" => match self.mode {
+                SimMode::CellularAutomaton => {
+                    self.world.clear();
+                    self.stack_origin = 0;
+                }
+                SimMode::Physics => self.physics.clear(),
+            },
+            "m" => {
+                self.mode = match self.mode {
+                    SimMode::CellularAutomaton => SimMode::Physics,
+                    SimMode::Physics => SimMode::CellularAutomaton,
+                };
             }
             "s" => self.save_snapshot(),
             "b" => {
@@ -315,10 +438,26 @@ impl SimulatorView {
                     return;
                 }
             }
-            "[" => {
-                self.rule_index = (self.rule_index + self.rules.len() - 1) % self.rules.len();
-            }
-            "]" => self.rule_index = (self.rule_index + 1) % self.rules.len(),
+            "[" => match self.mode {
+                SimMode::CellularAutomaton => {
+                    self.rule_index = (self.rule_index + self.rules.len() - 1) % self.rules.len();
+                }
+                SimMode::Physics => {
+                    let len = self.materials.len();
+                    self.selected_material =
+                        ((self.selected_material as usize + len - 1) % len) as MaterialId;
+                }
+            },
+            "]" => match self.mode {
+                SimMode::CellularAutomaton => {
+                    self.rule_index = (self.rule_index + 1) % self.rules.len();
+                }
+                SimMode::Physics => {
+                    self.selected_material =
+                        ((self.selected_material as usize + 1) % self.materials.len())
+                            as MaterialId;
+                }
+            },
             "t" => self.theme_index = (self.theme_index + 1) % self.themes.len(),
             "i" => self.invert_import = !self.invert_import,
             "left" => self.camera.pan_pixels(-PAN_STEP, 0.),
@@ -344,21 +483,62 @@ impl SimulatorView {
 
     fn begin_paint(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         let (x, y) = self.cell_at(event.position);
-        let value = !self.world.get(x, y);
-        self.painting = Some(value);
-        self.world.set(x, y, value);
+        match self.mode {
+            SimMode::CellularAutomaton => {
+                let value = !self.world.get(x, y);
+                self.painting = Some(value);
+                self.world.set(x, y, value);
+            }
+            SimMode::Physics => {
+                self.paint_material = Some(self.selected_material);
+                self.physics.set(x, y, self.selected_material);
+            }
+        }
         cx.notify();
     }
 
-    fn continue_paint(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        match event.pressed_button {
-            Some(MouseButton::Left) => {
+    /// Right-button stroke: always erases, in either mode.
+    fn begin_erase(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        let (x, y) = self.cell_at(event.position);
+        match self.mode {
+            SimMode::CellularAutomaton => {
+                self.painting = Some(false);
+                self.world.set(x, y, false);
+            }
+            SimMode::Physics => {
+                self.paint_material = Some(EMPTY);
+                self.physics.set(x, y, EMPTY);
+            }
+        }
+        cx.notify();
+    }
+
+    fn apply_stroke(&mut self, x: i64, y: i64, cx: &mut Context<Self>) {
+        match self.mode {
+            SimMode::CellularAutomaton => {
                 let Some(value) = self.painting else { return };
-                let (x, y) = self.cell_at(event.position);
                 if self.world.get(x, y) != value {
                     self.world.set(x, y, value);
                     cx.notify();
                 }
+            }
+            SimMode::Physics => {
+                let Some(material) = self.paint_material else {
+                    return;
+                };
+                if self.physics.get(x, y) != material {
+                    self.physics.set(x, y, material);
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn continue_paint(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        match event.pressed_button {
+            Some(MouseButton::Left) | Some(MouseButton::Right) => {
+                let (x, y) = self.cell_at(event.position);
+                self.apply_stroke(x, y, cx);
             }
             Some(MouseButton::Middle) => {
                 if let Some(last) = self.pan_last {
@@ -695,6 +875,70 @@ impl SimulatorView {
                     }),
             )
     }
+
+    fn render_palette_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = self.theme();
+        div()
+            .p_2()
+            .rounded_md()
+            .bg(rgb(t.panel_bg))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .text_sm()
+            .child(div().mb_1().text_color(rgb(t.text)).child("Materials"))
+            .children(self.materials.iter().enumerate().map(|(index, mat)| {
+                let id = index as MaterialId;
+                let selected = id == self.selected_material;
+                let label = if id == EMPTY {
+                    "Eraser".to_string()
+                } else {
+                    mat.name.clone()
+                };
+                div()
+                    .id(SharedString::from(format!("material-{index}")))
+                    .px_2()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(rgb(if selected { t.accent } else { t.panel_bg }))
+                    .when(selected, |el| el.bg(rgb(t.chip_bg)))
+                    .hover(move |el| el.bg(rgb(t.hover_bg)))
+                    .child(
+                        div()
+                            .size(px(14.))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(t.text_dim))
+                            .bg(rgb(if id == EMPTY { t.canvas_bg } else { mat.color })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(rgb(if selected { t.accent } else { t.text }))
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(t.text_dim))
+                            .child(mat.phase_label()),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected_material = id;
+                        cx.notify();
+                    }))
+            }))
+            .child(
+                div()
+                    .mt_1()
+                    .text_color(rgb(t.text_dim))
+                    .child("left-drag paints · right-drag erases"),
+            )
+    }
 }
 
 impl Render for SimulatorView {
@@ -704,22 +948,42 @@ impl Render for SimulatorView {
         let bounds_slot = self.canvas_bounds.clone();
 
         // Visible-region query: only cells on screen are collected and drawn.
+        // Colors are resolved here so the paint closure just draws quads.
         let (w, h) = self.canvas_size();
         let (min_x, min_y, max_x, max_y) = camera.visible_world_rect(w, h);
-        let live = self.world.live_cells_in(min_x, min_y, max_x, max_y);
+        let cells: Vec<(i64, i64, Hsla)> = match self.mode {
+            SimMode::CellularAutomaton => self
+                .world
+                .live_cells_in(min_x, min_y, max_x, max_y)
+                .into_iter()
+                .map(|(x, y)| (x, y, t.cell_color(x, y)))
+                .collect(),
+            SimMode::Physics => self
+                .physics
+                .cells_in(min_x, min_y, max_x, max_y)
+                .into_iter()
+                .map(|(x, y, m)| (x, y, rgb(self.materials[m as usize].color).into()))
+                .collect(),
+        };
 
-        let rule_label = match self.active_stack_entry() {
-            Some((index, entry)) => format!(
-                "stack {}/{}: {} ({})",
-                index + 1,
-                self.editor.stack.entries.len(),
-                entry.name,
-                entry.rule.notation()
-            ),
-            None => format!(
-                "{} ({})",
-                self.rules[self.rule_index].name,
-                self.current_rule().notation()
+        let mode_label = match self.mode {
+            SimMode::CellularAutomaton => match self.active_stack_entry() {
+                Some((index, entry)) => format!(
+                    "stack {}/{}: {} ({})",
+                    index + 1,
+                    self.editor.stack.entries.len(),
+                    entry.name,
+                    entry.rule.notation()
+                ),
+                None => format!(
+                    "{} ({})",
+                    self.rules[self.rule_index].name,
+                    self.current_rule().notation()
+                ),
+            },
+            SimMode::Physics => format!(
+                "painting {}",
+                self.materials[self.selected_material as usize].name
             ),
         };
 
@@ -743,16 +1007,16 @@ impl Render for SimulatorView {
                     .text_color(rgb(t.text))
                     .child(div().min_w(px(110.)).child(format!(
                         "gen {}",
-                        self.world.generation
+                        self.active_generation()
                     )))
                     .child(div().min_w(px(150.)).child(format!(
                         "pop {} ({:+})",
-                        self.world.population(),
+                        self.active_population(),
                         self.pop_delta
                     )))
                     .child(div().min_w(px(90.)).child(format!(
                         "chunks {}",
-                        self.world.chunk_count()
+                        self.active_chunk_count()
                     )))
                     .child(
                         div()
@@ -788,6 +1052,27 @@ impl Render for SimulatorView {
                     } else {
                         "⏸ paused"
                     }))
+                    .child(
+                        div()
+                            .id("mode-toggle")
+                            .px_2()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .bg(rgb(t.chip_bg))
+                            .text_color(rgb(t.accent))
+                            .hover(move |el| el.bg(rgb(t.hover_bg)))
+                            .child(match self.mode {
+                                SimMode::CellularAutomaton => "▦ automata",
+                                SimMode::Physics => "⌛ physics",
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.mode = match this.mode {
+                                    SimMode::CellularAutomaton => SimMode::Physics,
+                                    SimMode::Physics => SimMode::CellularAutomaton,
+                                };
+                                cx.notify();
+                            })),
+                    )
                     .child(format!("{:.1}×", self.camera.zoom))
                     .child(
                         div()
@@ -845,7 +1130,7 @@ impl Render for SimulatorView {
                                 cx.notify();
                             })),
                     )
-                    .child(div().flex_1().child(rule_label))
+                    .child(div().flex_1().child(mode_label))
                     .child(
                         div()
                             .id("save-state")
@@ -861,9 +1146,17 @@ impl Render for SimulatorView {
                             })),
                     )
                     .child({
-                        let has_snapshot = self.snapshot.is_some();
-                        let label = match &self.snapshot {
-                            Some(snapshot) => format!("⟲ gen {}", snapshot.generation),
+                        let snapshot_generation = match self.mode {
+                            SimMode::CellularAutomaton => {
+                                self.snapshot.as_ref().map(|s| s.generation)
+                            }
+                            SimMode::Physics => {
+                                self.physics_snapshot.as_ref().map(|s| s.generation)
+                            }
+                        };
+                        let has_snapshot = snapshot_generation.is_some();
+                        let label = match snapshot_generation {
+                            Some(generation) => format!("⟲ gen {generation}"),
                             None => "⟲ restore".to_string(),
                         };
                         div()
@@ -918,6 +1211,10 @@ impl Render for SimulatorView {
                                 cx.listener(|this, event, _, cx| this.begin_paint(event, cx)),
                             )
                             .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(|this, event, _, cx| this.begin_erase(event, cx)),
+                            )
+                            .on_mouse_down(
                                 MouseButton::Middle,
                                 cx.listener(|this, event: &MouseDownEvent, _, _| {
                                     this.pan_last = Some(event.position);
@@ -928,7 +1225,17 @@ impl Render for SimulatorView {
                             )
                             .on_mouse_up(
                                 MouseButton::Left,
-                                cx.listener(|this, _, _, _| this.painting = None),
+                                cx.listener(|this, _, _, _| {
+                                    this.painting = None;
+                                    this.paint_material = None;
+                                }),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Right,
+                                cx.listener(|this, _, _, _| {
+                                    this.painting = None;
+                                    this.paint_material = None;
+                                }),
                             )
                             .on_mouse_up(
                                 MouseButton::Middle,
@@ -946,7 +1253,7 @@ impl Render for SimulatorView {
                                         let h = f32::from(bounds.size.height) as f64;
                                         let cell = camera.zoom as f32;
                                         let gap = if cell >= 3. { 1. } else { 0. };
-                                        for (x, y) in live {
+                                        for (x, y, color) in cells {
                                             let (sx, sy) =
                                                 camera.world_to_screen(x as f64, y as f64, w, h);
                                             let cell_bounds = Bounds {
@@ -956,8 +1263,7 @@ impl Render for SimulatorView {
                                                 ),
                                                 size: size(px(cell - gap), px(cell - gap)),
                                             };
-                                            window
-                                                .paint_quad(fill(cell_bounds, t.cell_color(x, y)));
+                                            window.paint_quad(fill(cell_bounds, color));
                                         }
                                     },
                                 )
@@ -972,8 +1278,13 @@ impl Render for SimulatorView {
                             .flex()
                             .flex_col()
                             .gap_2()
-                            .child(self.render_rules_panel(cx))
-                            .child(self.render_stack_panel(cx)),
+                            .when(self.mode == SimMode::CellularAutomaton, |el| {
+                                el.child(self.render_rules_panel(cx))
+                                    .child(self.render_stack_panel(cx))
+                            })
+                            .when(self.mode == SimMode::Physics, |el| {
+                                el.child(self.render_palette_panel(cx))
+                            }),
                     ),
             )
             .child(
@@ -985,11 +1296,18 @@ impl Render for SimulatorView {
                     .justify_center()
                     .text_sm()
                     .text_color(rgb(t.text_dim))
-                    .child(
-                        "space pause · n step · , . speed · r randomize · c clear · s save · b back · \
-                         scroll zoom · middle-drag pan · arrows pan · 0 reset camera · \
-                         [ ] rule · t theme · i invert import · drag paint · ⌘Z undo stack edit",
-                    ),
+                    .child(match self.mode {
+                        SimMode::CellularAutomaton => {
+                            "space pause · n step · , . speed · m mode · r randomize · c clear · s save · b back · \
+                             scroll zoom · middle-drag pan · arrows pan · 0 reset camera · \
+                             [ ] rule · t theme · i invert import · drag paint · right-drag erase · ⌘Z undo stack edit"
+                        }
+                        SimMode::Physics => {
+                            "space pause · n step · , . speed · m mode · r sprinkle · c clear · s save · b back · \
+                             scroll zoom · middle-drag pan · arrows pan · 0 reset camera · \
+                             [ ] material · t theme · drag paint · right-drag erase"
+                        }
+                    }),
             )
     }
 }

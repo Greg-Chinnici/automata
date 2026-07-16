@@ -6,7 +6,7 @@ pub const CHUNK_SIZE: i64 = 64;
 const CHUNK_AREA: usize = (CHUNK_SIZE * CHUNK_SIZE) as usize;
 
 /// Split a world coordinate into (chunk coordinate, local coordinate).
-fn split(coord: i64) -> (i64, i64) {
+pub(crate) fn split(coord: i64) -> (i64, i64) {
     (coord.div_euclid(CHUNK_SIZE), coord.rem_euclid(CHUNK_SIZE))
 }
 
